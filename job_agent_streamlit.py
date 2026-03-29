@@ -375,6 +375,8 @@ def rank_jobs(
 
 def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, Any]:
     titles = plan.get("target_titles", [])[:8]
+    skills = plan.get("skills_keywords", [])[:6]
+
     if not titles:
         titles = [
             "QA Director",
@@ -387,25 +389,66 @@ def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, 
     loc = locations.strip() if locations else "United States"
     queries = []
 
+    strong_skill_terms = []
+    for skill in skills:
+        s = skill.lower()
+        if any(x in s for x in ["quality", "testing", "automation", "delivery", "agile", "telecom", "transformation"]):
+            strong_skill_terms.append(skill)
+
+    strong_skill_terms = strong_skill_terms[:3]
+
     for title in titles:
         queries.append({
+            "source": "broad-role-search",
+            "query": f'"{title}" jobs {loc}'
+        })
+        queries.append({
             "source": "linkedin",
-            "query": f'{title} jobs {loc} site:linkedin.com'
+            "query": f'"{title}" jobs {loc} site:linkedin.com/jobs'
         })
         queries.append({
             "source": "indeed",
-            "query": f'{title} jobs {loc} site:indeed.com'
+            "query": f'"{title}" jobs {loc} site:indeed.com'
         })
         queries.append({
             "source": "glassdoor",
-            "query": f'{title} jobs {loc} site:glassdoor.com'
+            "query": f'"{title}" jobs {loc} site:glassdoor.com'
         })
         queries.append({
-            "source": "general",
-            "query": f'{title} jobs {loc}'
+            "source": "company-careers",
+            "query": f'"{title}" {loc} (careers OR jobs)'
         })
 
-    plan["search_queries"] = queries
+        if strong_skill_terms:
+            queries.append({
+                "source": "skill-boosted",
+                "query": f'"{title}" {loc} {" ".join(strong_skill_terms[:2])} jobs'
+            })
+
+    # Add a few broader leadership queries to increase volume
+    broader_titles = [
+        "quality engineering",
+        "quality assurance",
+        "test automation",
+        "software quality",
+    ]
+    for broader in broader_titles:
+        queries.append({
+            "source": "broad-leadership",
+            "query": f'{broader} director OR "senior manager" OR "associate director" jobs {loc}'
+        })
+
+    # Deduplicate queries while preserving order
+    seen_queries = set()
+    deduped_queries = []
+    for q in queries:
+        key = q["query"].strip().lower()
+        if key in seen_queries:
+            continue
+        seen_queries.add(key)
+        deduped_queries.append(q)
+
+    plan["search_queries"] = deduped_queries
     return plan
 
     titles = plan.get("target_titles", [])[:4]
