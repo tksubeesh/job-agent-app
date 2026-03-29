@@ -24,6 +24,8 @@ except Exception:
 st.set_page_config(page_title="AI Job Search Agent", page_icon="💼", layout="wide")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
@@ -162,10 +164,42 @@ Resume:
 
 # Fallback web search (no API key required) using DuckDuckGo HTML results
 DDG_ENDPOINT = "https://duckduckgo.com/html/"
+ADZUNA_ENDPOINT = "https://api.adzuna.com/v1/api/jobs/us/search/1"
+
+
+def adzuna_search(query: str, location: str, num: int = 10) -> List[Dict[str, Any]]:
+    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+        return []
+
+    params = {
+        "app_id": ADZUNA_APP_ID,
+        "app_key": ADZUNA_APP_KEY,
+        "results_per_page": min(num, 20),
+        "what": query,
+        "where": location or "United States",
+        "content-type": "application/json",
+    }
+
+    try:
+        resp = requests.get(ADZUNA_ENDPOINT, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        jobs = []
+        for item in data.get("results", []):
+            jobs.append({
+                "title": item.get("title", "Untitled Job"),
+                "link": item.get("redirect_url") or item.get("adref", ""),
+                "snippet": item.get("description", "")[:300],
+                "displayed_link": item.get("company", {}).get("display_name", "Adzuna"),
+            })
+        return jobs
+    except Exception:
+        return []
+
 
 def serp_search(query: str, num: int = 10) -> List[Dict[str, Any]]:
     """
-    Improved DuckDuckGo search with better parsing
+    Fallback DuckDuckGo search. This is best-effort only and may be unreliable on cloud hosts.
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -180,25 +214,19 @@ def serp_search(query: str, num: int = 10) -> List[Dict[str, Any]]:
         html = resp.text
 
         results = []
-
-        # Improved regex patterns
         links = re.findall(r'<a[^>]+class="result__a"[^>]+href="(.*?)"[^>]*>(.*?)</a>', html)
 
         for link, title in links[:num]:
             clean_title = re.sub('<.*?>', '', title)
-
-            # Filter only job-related links
-            if any(domain in link.lower() for domain in ["linkedin", "indeed", "glassdoor", "jobs", "careers"]):
-                results.append({
-                    "title": clean_title,
-                    "link": link,
-                    "snippet": "",
-                    "displayed_link": link
-                })
+            results.append({
+                "title": clean_title,
+                "link": link,
+                "snippet": "",
+                "displayed_link": link
+            })
 
         return results
-
-    except Exception as e:
+    except Exception:
         return []
 
 
@@ -210,7 +238,7 @@ def normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 8) -> List[Dict[str, Any]]:
+def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 8, location: str = "United States") -> List[Dict[str, Any]]:
     all_jobs: List[Dict[str, Any]] = []
     seen = set()
 
@@ -220,7 +248,13 @@ def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 8) -> List[Di
         if not query:
             continue
 
-        results = serp_search(query, num=max_per_query)
+        results = []
+        if ADZUNA_APP_ID and ADZUNA_APP_KEY:
+            results = adzuna_search(query=query, location=location, num=max_per_query)
+
+        if not results:
+            results = serp_search(query, num=max_per_query)
+
         for r in results:
             title = r.get("title", "")
             link = r.get("link", "")
@@ -387,9 +421,11 @@ with st.sidebar:
     model_name = st.text_input("OpenAI model", value=DEFAULT_MODEL)
     max_results = st.slider("Max jobs to rank", min_value=10, max_value=50, value=25, step=5)
     st.markdown("**Required env vars**")
-    st.code("OPENAI_API_KEY")
+    st.code("OPENAI_API_KEY
+ADZUNA_APP_ID
+ADZUNA_APP_KEY")
     st.info(
-        "LinkedIn results are retrieved through web search results, not by scraping LinkedIn directly."
+        "LinkedIn scraping is intentionally avoided. For reliable job search results, configure Adzuna keys; DuckDuckGo fallback is best-effort only."
     )
 
 DEFAULT_MODEL = model_name
@@ -471,10 +507,13 @@ if run:
 
         with st.spinner("Searching job sources..."):
             st.write("Searching jobs from web...")
-            jobs = collect_jobs(plan, max_per_query=6)
+            jobs = collect_jobs(plan, max_per_query=6, location=locations)
 
         if not jobs:
-            st.warning("No job results found. Try broader roles or locations.")
+            if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+                st.warning("No job results found. DuckDuckGo fallback is unreliable on Streamlit Cloud. Add ADZUNA_APP_ID and ADZUNA_APP_KEY in Secrets for reliable internet job search.")
+            else:
+                st.warning("No job results found. Try broader roles or locations.")
             st.stop()
 
         with st.spinner("Ranking jobs..."):
