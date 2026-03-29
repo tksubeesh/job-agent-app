@@ -275,7 +275,8 @@ def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 12, location:
             snippet = r.get("snippet", "")
             display_link = r.get("displayed_link", "")
 
-            if senior_only and senior_keywords and not any(k in title for k in senior_keywords):
+            text_to_check = f"{title} {snippet.lower()}"
+            if senior_only and senior_keywords and not any(k in text_to_check for k in senior_keywords):
                 continue
 
             key = normalize_url(link)
@@ -375,7 +376,7 @@ def rank_jobs(
 
 def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, Any]:
     titles = plan.get("target_titles", [])[:8]
-    skills = plan.get("skills_keywords", [])[:6]
+    skills = plan.get("skills_keywords", [])[:8]
 
     if not titles:
         titles = [
@@ -387,96 +388,69 @@ def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, 
         ]
 
     loc = locations.strip() if locations else "United States"
+    skill_tokens = [re.sub(r"[^a-z0-9\\s]", "", s.lower()).strip() for s in skills if s.strip()]
+    skill_tokens = [s for s in skill_tokens if s]
+
+    # keep up to 5 high-value role/skill tokens
+    skill_tokens = skill_tokens[:5]
+    base_titles = [t.strip() for t in titles if t.strip()]
+
     queries = []
 
-    strong_skill_terms = []
-    for skill in skills:
-        s = skill.lower()
-        if any(x in s for x in ["quality", "testing", "automation", "delivery", "agile", "telecom", "transformation"]):
-            strong_skill_terms.append(skill)
+    def add(query_source: str, query_text: str):
+        queries.append({"source": query_source, "query": query_text.strip()})
 
-    strong_skill_terms = strong_skill_terms[:3]
+    for title in base_titles:
+        title_query = title.strip().replace('"', '')
+        if not title_query:
+            continue
 
-    for title in titles:
-        queries.append({
-            "source": "broad-role-search",
-            "query": f'"{title}" jobs {loc}'
-        })
-        queries.append({
-            "source": "linkedin",
-            "query": f'"{title}" jobs {loc} site:linkedin.com/jobs'
-        })
-        queries.append({
-            "source": "indeed",
-            "query": f'"{title}" jobs {loc} site:indeed.com'
-        })
-        queries.append({
-            "source": "glassdoor",
-            "query": f'"{title}" jobs {loc} site:glassdoor.com'
-        })
-        queries.append({
-            "source": "company-careers",
-            "query": f'"{title}" {loc} (careers OR jobs)'
-        })
+        # job board specific queries
+        add("linkedin", f'site:linkedin.com/jobs "{title_query}" "{loc}"')
+        add("indeed", f'site:indeed.com/jobs "{title_query}" "{loc}"')
+        add("glassdoor", f'site:glassdoor.com "{title_query}" "{loc}"')
+        add("company-careers", f'"{title_query}" "{loc}" (careers OR jobs OR "job openings")')
 
-        if strong_skill_terms:
-            queries.append({
-                "source": "skill-boosted",
-                "query": f'"{title}" {loc} {" ".join(strong_skill_terms[:2])} jobs'
-            })
+        # broad query plus skills
+        if skill_tokens:
+            skills_part = " ".join([f'"{t}"' for t in skill_tokens[:3]])
+            add("skill-boosted", f'"{title_query}" {loc} {skills_part} jobs')
 
-    # Add a few broader leadership queries to increase volume
-    broader_titles = [
-        "quality engineering",
-        "quality assurance",
-        "test automation",
-        "software quality",
+        # fallback broad role query
+        add("broad-role", f'"{title_query}" jobs {loc} "{skill_tokens[0] if skill_tokens else ""}"')
+
+    # Extra broader skill/leadership queries for volume and match diversity
+    broader_patterns = [
+        "quality engineering director",
+        "quality assurance director",
+        "test automation lead",
+        "software quality manager",
     ]
-    for broader in broader_titles:
-        queries.append({
-            "source": "broad-leadership",
-            "query": f'{broader} director OR "senior manager" OR "associate director" jobs {loc}'
-        })
+
+    for broader in broader_patterns:
+        searchable = broader.replace('"', '')
+        add("broad-leadership", f'site:linkedin.com/jobs "{searchable}" "{loc}"')
+        if skill_tokens:
+            add("broad-leadership-skill", f'"{searchable}" "{loc}" {" ".join([f"\"{t}\"" for t in skill_tokens[:2]])}')
+
+    # add localized remote-oriented query too
+    lead_titles = base_titles[:3] if base_titles else []
+    for lead in lead_titles:
+        if lead:
+            add("remote", f'"{lead}" remote {loc} jobs')
 
     # Deduplicate queries while preserving order
     seen_queries = set()
     deduped_queries = []
     for q in queries:
         key = q["query"].strip().lower()
-        if key in seen_queries:
+        if key in seen_queries or not key:
             continue
         seen_queries.add(key)
         deduped_queries.append(q)
 
     plan["search_queries"] = deduped_queries
     return plan
-
-    titles = plan.get("target_titles", [])[:4]
-    if not titles:
-        titles = ["Software QA Director", "Quality Engineering Director"]
-
-    loc = locations.strip() if locations else "United States"
-    queries = []
-    for title in titles:
-        queries.append({
-            "source": "linkedin",
-            "query": f'site:linkedin.com/jobs/view "{title}" "{loc}"'
-        })
-        queries.append({
-            "source": "indeed",
-            "query": f'site:indeed.com/viewjob OR site:indeed.com/jobs "{title}" "{loc}"'
-        })
-        queries.append({
-            "source": "glassdoor",
-            "query": f'site:glassdoor.com/job-listing "{title}" "{loc}"'
-        })
-        queries.append({
-            "source": "company-careers",
-            "query": f'("careers" OR "jobs") "{title}" "{loc}"'
-        })
-    plan["search_queries"] = queries
-    return plan
-
 
 # -----------------------------
 # UI
