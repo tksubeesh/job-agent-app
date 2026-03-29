@@ -421,7 +421,7 @@ with st.sidebar:
     model_name = st.text_input("OpenAI model", value=DEFAULT_MODEL)
     max_results = st.slider("Max jobs to rank", min_value=10, max_value=50, value=25, step=5)
     st.markdown("**Required env vars**")
-    st.code("OPENAI_API_KEY
+    st.code("""OPENAI_API_KEY
 ADZUNA_APP_ID
 ADZUNA_APP_KEY")
     st.info(
