@@ -247,7 +247,7 @@ def normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 12, location: str = "United States") -> List[Dict[str, Any]]:
+def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 12, location: str = "United States", senior_only: bool = False) -> List[Dict[str, Any]]:
     all_jobs: List[Dict[str, Any]] = []
     seen = set()
 
@@ -275,7 +275,7 @@ def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 12, location:
             snippet = r.get("snippet", "")
             display_link = r.get("displayed_link", "")
 
-            if senior_keywords and not any(k in title for k in senior_keywords):
+            if senior_only and senior_keywords and not any(k in title for k in senior_keywords):
                 continue
 
             key = normalize_url(link)
@@ -445,6 +445,7 @@ with st.sidebar:
     st.header("Configuration")
     model_name = st.text_input("OpenAI model", value=DEFAULT_MODEL)
     max_results = st.slider("Max jobs to rank", min_value=10, max_value=100, value=25, step=5)
+    senior_only = st.checkbox("Only senior roles", value=False)
     st.markdown("**Required env vars**")
     st.code("""OPENAI_API_KEY
 ADZUNA_APP_ID
@@ -532,8 +533,12 @@ if run:
 
         with st.spinner("Searching job sources..."):
             st.write("Searching jobs from web...")
-            jobs = collect_jobs(plan, max_per_query=max(12, max_results), location=locations)
+            jobs = collect_jobs(plan, max_per_query=max(12, max_results), location=locations, senior_only=senior_only)
             st.write(f"Fetched {len(jobs)} candidate jobs before ranking.")
+            if len(jobs) < max_results and senior_only:
+                fallback_jobs = collect_jobs(plan, max_per_query=max(12, max_results), location=locations, senior_only=False)
+                st.write(f"Senior-only filter was too strict. Fallback broad search found {len(fallback_jobs)} jobs.")
+                jobs = fallback_jobs
 
         if not jobs:
             if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
@@ -553,7 +558,7 @@ if run:
 
         st.subheader(f"Top Matches ({len(ranked_jobs)})")
         if len(ranked_jobs) < max_results:
-            st.info(f"Only {len(ranked_jobs)} matching roles were found after filtering. To get closer to {max_results}, broaden locations, add more designations, or relax seniority filters.")
+            st.info(f"Only {len(ranked_jobs)} matching roles were found after filtering. To get closer to {max_results}, broaden locations, add more designations, or turn off 'Only senior roles'.")
         for job in ranked_jobs:
             with st.container(border=True):
                 st.markdown(f"### [{job.get('title', 'Untitled Job')}]({job.get('url', '#')})")
