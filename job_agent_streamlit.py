@@ -1,612 +1,865 @@
+import html
+import math
 import os
-import io
-import json
 import re
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import requests
 import streamlit as st
-from openai import OpenAI
-
-try:
-    import PyPDF2
-except Exception:
-    PyPDF2 = None
-
-try:
-    import docx
-except Exception:
-    docx = None
-
-# -----------------------------
-# Config
-# -----------------------------
-st.set_page_config(page_title="AI Job Search Agent", page_icon="💼", layout="wide")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
-ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
-# -----------------------------
+# =========================
+# App Config
+# =========================
+st.set_page_config(
+    page_title="Job Search Agent",
+    page_icon="🔎",
+    layout="wide",
+)
+
+REQUEST_TIMEOUT = 20
+DEFAULT_MAX_RESULTS = 25
+MAX_QUERIES = 18
+USER_AGENT = "job-search-agent/2.0"
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+}
+
+
+# =========================
+# Data Model
+# =========================
+@dataclass
+class JobRecord:
+    source: str
+    source_id: str
+    title: str
+    company: str
+    location: str
+    remote_type: str
+    description: str
+    url: str
+    posted_at: str
+    salary: str
+    employment_type: str
+    tags: List[str]
+    raw: Dict[str, Any]
+    match_score: float = 0.0
+    match_explanation: str = ""
+
+
+# =========================
 # Helpers
-# -----------------------------
-def get_openai_client() -> OpenAI:
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY is not set.")
-    return OpenAI(api_key=OPENAI_API_KEY)
-
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    if PyPDF2 is None:
-        raise RuntimeError("PyPDF2 is not installed. Run: pip install PyPDF2")
-    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-    pages = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
-        except Exception:
-            pages.append("")
-    return "\n".join(pages).strip()
-
-
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    if docx is None:
-        raise RuntimeError("python-docx is not installed. Run: pip install python-docx")
-    document = docx.Document(io.BytesIO(file_bytes))
-    return "\n".join(p.text for p in document.paragraphs).strip()
-
-
-def extract_resume_text(uploaded_file) -> str:
-    if uploaded_file is None:
+# =========================
+def clean_html(text: Any) -> str:
+    if not text:
         return ""
-
-    file_bytes = uploaded_file.read()
-    name = uploaded_file.name.lower()
-
-    if name.endswith(".pdf"):
-        return extract_text_from_pdf(file_bytes)
-    if name.endswith(".docx"):
-        return extract_text_from_docx(file_bytes)
-    if name.endswith(".txt"):
-        return file_bytes.decode("utf-8", errors="ignore")
-
-    raise ValueError("Unsupported resume format. Please upload PDF, DOCX, or TXT.")
+    text = str(text)
+    text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-SCHEMA = {
-    "type": "json_schema",
-    "name": "job_search_plan",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "candidate_summary": {"type": "string"},
-            "target_titles": {
-                "type": "array",
-                "items": {"type": "string"}
-            },
-            "skills_keywords": {
-                "type": "array",
-                "items": {"type": "string"}
-            },
-            "search_queries": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "source": {"type": "string"},
-                        "query": {"type": "string"}
-                    },
-                    "required": ["source", "query"]
-                }
-            }
-        },
-        "required": ["candidate_summary", "target_titles", "skills_keywords", "search_queries"]
-    }
-}
+def normalize_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
 
-def build_search_plan(
-    resume_text: str,
-    expected_roles: str,
-    expected_designations: str,
-    locations: str,
-) -> Dict[str, Any]:
-    client = get_openai_client()
-
-    prompt = f"""
-You are helping build a job-search agent.
-
-Inputs:
-1) Resume text
-2) Expected roles
-3) Expected designations
-4) Preferred locations
-
-Create:
-- a concise candidate summary
-- target job titles
-- core skill keywords
-- search queries for multiple sources: LinkedIn, Indeed, Glassdoor, company careers, and general web
-
-Rules:
-- Prefer seniority consistent with the resume and user intent
-- Generate practical search strings
-- Include location when available
-- Keep queries optimized for public web search APIs
-- Return valid JSON only
-
-Expected roles:
-{expected_roles}
-
-Expected designations:
-{expected_designations}
-
-Preferred locations:
-{locations}
-
-Resume:
-{resume_text[:18000]}
-"""
-
-    response = client.responses.create(
-        timeout=60,
-        model=DEFAULT_MODEL,
-        input=prompt,
-        text={"format": SCHEMA},
-    )
-
-    return json.loads(response.output_text)
+def contains_any(text: str, phrases: List[str]) -> bool:
+    text_n = normalize_text(text)
+    return any(p in text_n for p in phrases)
 
 
-# Fallback web search (no API key required) using DuckDuckGo HTML results
-DDG_ENDPOINT = "https://duckduckgo.com/html/"
-ADZUNA_ENDPOINT = "https://api.adzuna.com/v1/api/jobs/us/search/1"
-
-
-def adzuna_search(query: str, location: str, num: int = 10) -> List[Dict[str, Any]]:
-    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-        return []
-
-    jobs = []
-    pages_to_fetch = max(1, min(3, (num + 19) // 20))
-
+def safe_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     try:
-        for page in range(1, pages_to_fetch + 1):
-            endpoint = f"https://api.adzuna.com/v1/api/jobs/us/search/{page}"
-            params = {
-                "app_id": ADZUNA_APP_ID,
-                "app_key": ADZUNA_APP_KEY,
-                "results_per_page": min(20, num),
-                "what": query,
-                "where": location or "United States",
-                "content-type": "application/json",
-            }
-
-            resp = requests.get(endpoint, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-
-            for item in data.get("results", []):
-                jobs.append({
-                    "title": item.get("title", "Untitled Job"),
-                    "link": item.get("redirect_url") or item.get("adref", ""),
-                    "snippet": item.get("description", "")[:300],
-                    "displayed_link": item.get("company", {}).get("display_name", "Adzuna"),
-                })
-
-                if len(jobs) >= num:
-                    return jobs[:num]
-
-        return jobs[:num]
+        response = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
     except Exception:
-        return []
+        return None
 
 
-def serp_search(query: str, num: int = 10) -> List[Dict[str, Any]]:
-    """
-    Fallback DuckDuckGo search. This is best-effort only and may be unreliable on cloud hosts.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    params = {
-        "q": query
-    }
-
+def parse_datetime_like(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
     try:
-        resp = requests.post(DDG_ENDPOINT, data=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
-
-        results = []
-        links = re.findall(r'<a[^>]+class="result__a"[^>]+href="(.*?)"[^>]*>(.*?)</a>', html)
-
-        for link, title in links[:num]:
-            clean_title = re.sub('<.*?>', '', title)
-            results.append({
-                "title": clean_title,
-                "link": link,
-                "snippet": "",
-                "displayed_link": link
-            })
-
-        return results
+        text = text.replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
     except Exception:
-        return []
+        pass
 
-
-def normalize_url(url: str) -> str:
-    if not url:
-        return ""
-    url = re.sub(r"#.*$", "", url)
-    url = re.sub(r"\?.*$", "", url)
-    return url.rstrip("/")
-
-
-def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 12, location: str = "United States", senior_only: bool = False) -> List[Dict[str, Any]]:
-    all_jobs: List[Dict[str, Any]] = []
-    seen = set()
-
-    senior_keywords = [
-        "director", "senior director", "executive director", "head", "vp", "vice president",
-        "senior manager", "associate director", "principal", "lead"
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
     ]
-
-    for item in search_plan.get("search_queries", []):
-        source = item.get("source", "web")
-        query = item.get("query", "")
-        if not query:
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
             continue
-
-        results = []
-        if ADZUNA_APP_ID and ADZUNA_APP_KEY:
-            results = adzuna_search(query=query, location=location, num=max_per_query)
-
-        if not results:
-            results = serp_search(query, num=max_per_query)
-
-        for r in results:
-            title = r.get("title", "").lower()
-            link = r.get("link", "")
-            snippet = r.get("snippet", "")
-            display_link = r.get("displayed_link", "")
-
-            text_to_check = f"{title} {snippet.lower()}"
-            if senior_only and senior_keywords and not any(k in text_to_check for k in senior_keywords):
-                continue
-
-            key = normalize_url(link)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-
-            all_jobs.append(
-                {
-                    "source": source,
-                    "title": r.get("title", ""),
-                    "url": link,
-                    "snippet": snippet,
-                    "display_link": display_link,
-                }
-            )
-
-    return all_jobs
+    return None
 
 
-RANK_SCHEMA = {
-    "type": "json_schema",
-    "name": "ranked_jobs",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "jobs": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "index": {"type": "integer"},
-                        "fit_score": {"type": "integer"},
-                        "reason": {"type": "string"},
-                        "match_highlights": {
-                            "type": "array",
-                            "items": {"type": "string"}
-                        }
-                    },
-                    "required": ["index", "fit_score", "reason", "match_highlights"]
-                }
-            }
-        },
-        "required": ["jobs"]
-    }
-}
+def days_ago_text(value: Any) -> str:
+    dt = parse_datetime_like(value)
+    if not dt:
+        return "Unknown"
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = now - dt
+    days = delta.days
+    if days <= 0:
+        hours = max(int(delta.total_seconds() // 3600), 0)
+        return f"{hours}h ago" if hours > 0 else "Today"
+    if days == 1:
+        return "1 day ago"
+    if days < 30:
+        return f"{days} days ago"
+    months = max(days // 30, 1)
+    return f"{months} mo ago"
 
 
-def rank_jobs(
-    resume_text: str,
-    expected_roles: str,
-    expected_designations: str,
-    jobs: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    if not jobs:
-        return []
+def compact_list(items: List[str], max_items: int = 6) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        item = re.sub(r"\s+", " ", str(item or "").strip())
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out[:max_items]
 
-    client = get_openai_client()
-    trimmed_jobs = jobs[:50]
 
-    prompt = {
-        "resume_text": resume_text[:14000],
-        "expected_roles": expected_roles,
-        "expected_designations": expected_designations,
-        "jobs": [
-            {
-                "index": i,
-                "title": j["title"],
-                "url": j["url"],
-                "snippet": j["snippet"],
-                "source": j["source"],
-            }
-            for i, j in enumerate(trimmed_jobs)
-        ],
-        "task": "Score each job for relevance to the candidate from 0 to 100, based on likely match to resume and stated goals."
-    }
+def to_csv_download(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
-    response = client.responses.create(
-        timeout=60,
-        model=DEFAULT_MODEL,
-        input=json.dumps(prompt),
-        text={"format": RANK_SCHEMA},
-    )
 
-    ranked = json.loads(response.output_text)["jobs"]
-    merged = []
-    for item in ranked:
-        idx = item["index"]
-        if 0 <= idx < len(trimmed_jobs):
-            merged.append({**trimmed_jobs[idx], **item})
-
-    merged.sort(key=lambda x: x.get("fit_score", 0), reverse=True)
+# =========================
+# Query Generation
+# =========================
+def build_title_pool(user_titles: List[str]) -> List[str]:
+    defaults = [
+        "Director Quality Engineering",
+        "Director QA",
+        "Director Testing",
+        "Head of QA",
+        "Director Test Automation",
+        "Director Quality Transformation",
+        "Delivery Director",
+        "Program Delivery Director",
+        "Director Digital Delivery",
+        "Quality Engineering Leader",
+        "Testing Transformation Leader",
+        "Client Partner",
+        "Engagement Director",
+        "Business Relationship Manager",
+    ]
+    merged = compact_list(user_titles + defaults, max_items=30)
     return merged
 
 
-def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, Any]:
-    titles = plan.get("target_titles", [])[:8]
-    skills = plan.get("skills_keywords", [])[:8]
+def generate_search_queries(profile: Dict[str, Any]) -> List[str]:
+    titles = build_title_pool(profile["preferred_titles"])
+    location = profile["location"]
+    include_remote = profile["include_remote"]
+    skills = compact_list(profile["skills"] + [
+        "quality engineering",
+        "test automation",
+        "QA transformation",
+        "digital transformation",
+        "program delivery",
+        "enterprise delivery",
+        "stakeholder management",
+        "portfolio delivery",
+        "AI testing",
+        "GenAI",
+    ], max_items=20)
 
-    if not titles:
-        titles = [
-            "QA Director",
-            "Quality Engineering Director",
-            "Senior Manager Quality Engineering",
-            "Associate Director QA",
-            "VP Quality Assurance",
-        ]
+    industries = compact_list(profile["industries"] + [
+        "telecom",
+        "technology",
+        "enterprise",
+        "digital",
+    ], max_items=12)
 
-    loc = locations.strip() if locations else "United States"
-    skill_tokens = [re.sub(r"[^a-z0-9\\s]", "", s.lower()).strip() for s in skills if s.strip()]
-    skill_tokens = [s for s in skill_tokens if s]
+    queries: List[str] = []
 
-    # keep up to 5 high-value role/skill tokens
-    skill_tokens = skill_tokens[:5]
-    base_titles = [t.strip() for t in titles if t.strip()]
+    for title in titles[:12]:
+        queries.append(title)
 
-    queries = []
+        if location:
+            queries.append(f"{title} {location}")
 
-    def add(query_source: str, query_text: str):
-        queries.append({"source": query_source, "query": query_text.strip()})
+        if include_remote:
+            queries.append(f"{title} remote")
+            queries.append(f"{title} hybrid")
 
-    for title in base_titles:
-        title_query = title.strip().replace('"', '')
-        if not title_query:
+        for skill in skills[:3]:
+            queries.append(f"{title} {skill}")
+
+        for industry in industries[:2]:
+            queries.append(f"{title} {industry}")
+
+    # Add broader adjacency
+    adjacency = [
+        "Director Delivery",
+        "Transformation Director",
+        "Quality Leader",
+        "Engineering Program Director",
+        "QA Leader",
+        "Enterprise Delivery Leader",
+    ]
+    queries.extend(adjacency)
+
+    # Clean + dedupe + cap
+    final_queries: List[str] = []
+    seen = set()
+    for q in queries:
+        q = re.sub(r"\s+", " ", q).strip()
+        if not q:
             continue
+        k = q.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        final_queries.append(q)
 
-        # job board specific queries
-        add("linkedin", f'site:linkedin.com/jobs "{title_query}" "{loc}"')
-        add("indeed", f'site:indeed.com/jobs "{title_query}" "{loc}"')
-        add("glassdoor", f'site:glassdoor.com "{title_query}" "{loc}"')
-        add("company-careers", f'"{title_query}" "{loc}" (careers OR jobs OR "job openings")')
+    return final_queries[:MAX_QUERIES]
 
-        # broad query plus skills
-        if skill_tokens:
-            skills_part = " ".join([f'"{t}"' for t in skill_tokens[:3]])
-            add("skill-boosted", f'"{title_query}" {loc} {skills_part} jobs')
 
-        # fallback broad role query
-        add("broad-role", f'"{title_query}" jobs {loc} "{skill_tokens[0] if skill_tokens else ""}"')
+def broaden_query(query: str) -> List[str]:
+    variants = [query]
 
-    # Extra broader skill/leadership queries for volume and match diversity
-    broader_patterns = [
-        "quality engineering director",
-        "quality assurance director",
-        "test automation lead",
-        "software quality manager",
+    replacements = [
+        ("Director Quality Engineering", "Director QA"),
+        ("Director QA", "Head of QA"),
+        ("Director Testing", "QA Leader"),
+        ("Program Delivery Director", "Delivery Director"),
+        ("Director Quality Transformation", "Transformation Director"),
+        ("Client Partner", "Engagement Director"),
+        ("Business Relationship Manager", "Client Partner"),
+        ("Quality Engineering Leader", "Quality Leader"),
     ]
 
-    for broader in broader_patterns:
-        searchable = broader.replace('"', '')
-        add("broad-leadership", f'site:linkedin.com/jobs "{searchable}" "{loc}"')
-        if skill_tokens:
-            add("broad-leadership-skill", f'"{searchable}" "{loc}" {" ".join([f"\"{t}\"" for t in skill_tokens[:2]])}')
+    for old, new in replacements:
+        if old.lower() in query.lower():
+            variants.append(re.sub(re.escape(old), new, query, flags=re.I))
 
-    # add localized remote-oriented query too
-    lead_titles = base_titles[:3] if base_titles else []
-    for lead in lead_titles:
-        if lead:
-            add("remote", f'"{lead}" remote {loc} jobs')
+    stripped = re.sub(r"\b(remote|hybrid)\b", " ", query, flags=re.I)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if stripped and stripped.lower() != query.lower():
+        variants.append(stripped)
 
-    # Deduplicate queries while preserving order
-    seen_queries = set()
-    deduped_queries = []
-    for q in queries:
-        key = q["query"].strip().lower()
-        if key in seen_queries or not key:
+    generic_titles = [
+        "Director QA",
+        "Head of QA",
+        "Delivery Director",
+        "Program Director",
+        "Client Partner",
+        "Transformation Director",
+    ]
+    for title in generic_titles:
+        if title.lower() in query.lower():
+            variants.append(title)
+
+    out = []
+    seen = set()
+    for item in variants:
+        item = re.sub(r"\s+", " ", item).strip()
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+# =========================
+# Source Adapters
+# =========================
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_remotive(query: str) -> List[JobRecord]:
+    """
+    Official public endpoint supports:
+    GET https://remotive.com/api/remote-jobs?search=...
+    """
+    payload = safe_get(
+        "https://remotive.com/api/remote-jobs",
+        params={"search": query},
+    )
+    if not payload:
+        return []
+
+    jobs = payload.get("jobs", [])
+    results: List[JobRecord] = []
+
+    for item in jobs:
+        title = item.get("title", "")
+        company = item.get("company_name", "")
+        location = item.get("candidate_required_location", "") or "Remote"
+        description = clean_html(item.get("description", ""))
+        url = item.get("url", "")
+        job_id = str(item.get("id", ""))
+        posted_at = item.get("publication_date", "")
+        salary = item.get("salary", "")
+        category = item.get("category", "")
+        employment_type = str(item.get("job_type", "")).replace("_", " ").title()
+
+        tags = compact_list([category, employment_type, "Remote"])
+
+        results.append(
+            JobRecord(
+                source="Remotive",
+                source_id=job_id or f"remotive-{hash(url)}",
+                title=title,
+                company=company,
+                location=location,
+                remote_type="Remote",
+                description=description,
+                url=url,
+                posted_at=posted_at,
+                salary=salary,
+                employment_type=employment_type,
+                tags=tags,
+                raw=item,
+            )
+        )
+
+    return results
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_arbeitnow_pages(page_count: int = 6) -> List[JobRecord]:
+    """
+    Arbeitnow free API is no-key and page based.
+    We fetch pages broadly and do our own ranking locally.
+    """
+    results: List[JobRecord] = []
+
+    for page in range(1, page_count + 1):
+        payload = safe_get(
+            "https://www.arbeitnow.com/api/job-board-api",
+            params={"page": page},
+        )
+        if not payload:
             continue
-        seen_queries.add(key)
-        deduped_queries.append(q)
 
-    plan["search_queries"] = deduped_queries
-    return plan
+        data = payload.get("data", [])
+        if not data:
+            continue
 
-# -----------------------------
+        for item in data:
+            title = item.get("title", "")
+            company = item.get("company_name", "") or item.get("company", "")
+            location_parts = item.get("location", []) or []
+            if isinstance(location_parts, list):
+                location = ", ".join([str(x) for x in location_parts if x]) or "Germany"
+            else:
+                location = str(location_parts or "Germany")
+
+            remote_flag = item.get("remote", False)
+            remote_type = "Remote/Hybrid" if remote_flag else "Onsite/Hybrid"
+
+            description = clean_html(item.get("description", ""))
+            url = item.get("url", "")
+            job_id = str(item.get("slug", "")) or str(item.get("id", "")) or f"arbeitnow-{hash(url)}"
+            posted_at = item.get("created_at", "") or item.get("updated_at", "")
+            salary = item.get("salary", "") or ""
+            employment_type = ", ".join(item.get("job_types", []) or [])
+            tags = compact_list(
+                (item.get("tags", []) or [])
+                + (item.get("job_types", []) or [])
+                + (["Visa Sponsorship"] if item.get("visa_sponsorship") else [])
+                + (["Remote"] if remote_flag else [])
+            )
+
+            results.append(
+                JobRecord(
+                    source="Arbeitnow",
+                    source_id=job_id,
+                    title=title,
+                    company=company,
+                    location=location,
+                    remote_type=remote_type,
+                    description=description,
+                    url=url,
+                    posted_at=posted_at,
+                    salary=salary,
+                    employment_type=employment_type,
+                    tags=tags,
+                    raw=item,
+                )
+            )
+
+    return results
+
+
+# =========================
+# Ranking / Filtering
+# =========================
+def normalize_for_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", normalize_text(text)).strip()
+
+
+def make_job_key(job: JobRecord) -> str:
+    title = normalize_for_key(job.title)
+    company = normalize_for_key(job.company)
+    location = normalize_for_key(job.location)
+    return f"{title}|{company}|{location}"
+
+
+def dedupe_jobs(jobs: List[JobRecord]) -> List[JobRecord]:
+    best_by_key: Dict[str, JobRecord] = {}
+
+    for job in jobs:
+        key = make_job_key(job)
+        existing = best_by_key.get(key)
+        if existing is None:
+            best_by_key[key] = job
+        else:
+            # Keep the one with richer description / url
+            existing_len = len(existing.description or "")
+            current_len = len(job.description or "")
+            if current_len > existing_len:
+                best_by_key[key] = job
+
+    return list(best_by_key.values())
+
+
+def score_job(job: JobRecord, profile: Dict[str, Any], strictness: str) -> Tuple[float, List[str]]:
+    title = normalize_text(job.title)
+    description = normalize_text(job.description)
+    company = normalize_text(job.company)
+    location = normalize_text(job.location)
+    all_text = " ".join([title, description, company, location, " ".join([normalize_text(t) for t in job.tags])])
+
+    score = 0.0
+    reasons: List[str] = []
+
+    # 1) Strong titles
+    strong_titles = [
+        "director quality engineering",
+        "director qa",
+        "director testing",
+        "head of qa",
+        "director test automation",
+        "director quality transformation",
+        "delivery director",
+        "program delivery director",
+        "director digital delivery",
+        "quality engineering leader",
+        "testing transformation leader",
+        "client partner",
+        "engagement director",
+        "business relationship manager",
+    ]
+    for phrase in strong_titles:
+        if phrase in title:
+            score += 36
+            reasons.append("strong title fit")
+
+    # 2) Leadership signals
+    leadership_terms = [
+        "director", "head", "leader", "lead", "portfolio", "stakeholder",
+        "governance", "delivery", "transformation", "executive", "program",
+    ]
+    leadership_hits = 0
+    for term in leadership_terms:
+        if term in title:
+            score += 7
+            leadership_hits += 1
+        if term in description:
+            score += 2.2
+    if leadership_hits >= 2:
+        reasons.append("leadership alignment")
+
+    # 3) QE / Testing / Delivery fit
+    fit_terms = [
+        "quality engineering",
+        "quality assurance",
+        "qa",
+        "testing",
+        "test automation",
+        "automation",
+        "sdet",
+        "enterprise delivery",
+        "program delivery",
+        "digital transformation",
+        "release management",
+        "agile",
+        "safe",
+        "telecom",
+        "genai",
+        "gen ai",
+        "ai testing",
+    ]
+    fit_hits = 0
+    for term in fit_terms:
+        if term in title:
+            score += 11
+            fit_hits += 1
+        if term in description:
+            score += 3.5
+            fit_hits += 1
+    if fit_hits >= 2:
+        reasons.append("functional fit")
+
+    # 4) Preferred titles
+    user_titles = [normalize_text(x) for x in profile["preferred_titles"]]
+    for ut in user_titles:
+        if ut and ut in title:
+            score += 18
+            reasons.append("matches preferred title")
+            break
+
+    # 5) Skills / industries
+    for skill in [normalize_text(x) for x in profile["skills"]]:
+        if skill and skill in all_text:
+            score += 5
+    for industry in [normalize_text(x) for x in profile["industries"]]:
+        if industry and industry in all_text:
+            score += 4
+
+    # 6) Location / remote fit
+    preferred_location = normalize_text(profile["location"])
+    if preferred_location and preferred_location in location:
+        score += 12
+        reasons.append("location fit")
+
+    if profile["include_remote"]:
+        if contains_any(job.remote_type, ["remote"]) or contains_any(location, ["remote", "worldwide", "usa only"]):
+            score += 10
+            reasons.append("remote-friendly")
+
+    # 7) Seniority penalty
+    penalty_terms = [
+        "intern", "junior", "entry level", "coordinator", "analyst",
+        "technician", "manual tester", "qa tester", "sdet i", "sdet ii",
+        "associate", "specialist",
+    ]
+    for term in penalty_terms:
+        if term in title:
+            score -= 30
+
+    # 8) Exclude keywords
+    for term in [normalize_text(x) for x in profile["exclude_keywords"]]:
+        if term and term in all_text:
+            score -= 18
+
+    # 9) Required keywords
+    required_terms = [normalize_text(x) for x in profile["must_have_keywords"]]
+    if required_terms:
+        matched_required = sum(1 for term in required_terms if term and term in all_text)
+        score += matched_required * 6
+        if strictness == "Strict" and matched_required == 0:
+            score -= 25
+
+    # 10) Recency boost
+    dt = parse_datetime_like(job.posted_at)
+    if dt:
+        now = datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        days_old = max((now - dt).days, 0)
+        if days_old <= 3:
+            score += 8
+        elif days_old <= 7:
+            score += 5
+        elif days_old <= 30:
+            score += 2
+
+    # Strictness tuning
+    if strictness == "Strict":
+        if "director" in title or "head" in title:
+            score += 8
+        if "manager" in title:
+            score -= 6
+    elif strictness == "Broad":
+        if "manager" in title:
+            score += 4
+        if "lead" in title:
+            score += 3
+
+    # Explanation cleanup
+    reasons = compact_list(reasons, max_items=4)
+    if not reasons:
+        reasons = ["adjacent leadership relevance"]
+
+    return round(score, 1), reasons
+
+
+def finalize_results(raw_jobs: List[JobRecord], profile: Dict[str, Any], strictness: str, top_n: int) -> Dict[str, Any]:
+    deduped = dedupe_jobs(raw_jobs)
+
+    for job in deduped:
+        score, reasons = score_job(job, profile, strictness)
+        job.match_score = score
+        job.match_explanation = ", ".join(reasons)
+
+    ranked = sorted(deduped, key=lambda x: x.match_score, reverse=True)
+
+    threshold_map = {
+        "Strict": 32,
+        "Balanced": 24,
+        "Broad": 16,
+    }
+    threshold = threshold_map.get(strictness, 24)
+
+    filtered = [job for job in ranked if job.match_score >= threshold]
+
+    if len(filtered) < top_n:
+        filtered = ranked[:top_n]
+
+    return {
+        "raw_count": len(raw_jobs),
+        "deduped_count": len(deduped),
+        "final_count": len(filtered[:top_n]),
+        "jobs": filtered[:top_n],
+        "threshold": threshold,
+    }
+
+
+# =========================
+# Search Orchestration
+# =========================
+def run_search(profile: Dict[str, Any], strictness: str, top_n: int) -> Dict[str, Any]:
+    queries = generate_search_queries(profile)
+
+    all_jobs: List[JobRecord] = []
+    query_log: List[Tuple[str, int]] = []
+
+    # Broad source: Arbeitnow pages once
+    arbeitnow_jobs = fetch_arbeitnow_pages(page_count=6)
+    all_jobs.extend(arbeitnow_jobs)
+    query_log.append(("Arbeitnow broad pages", len(arbeitnow_jobs)))
+
+    # Query-based source: Remotive
+    for query in queries:
+        jobs = fetch_remotive(query)
+        all_jobs.extend(jobs)
+        query_log.append((f"Remotive: {query}", len(jobs)))
+
+    # Fallback broadening if too thin
+    if len(all_jobs) < 80:
+        expanded: List[str] = []
+        for q in queries[:8]:
+            expanded.extend(broaden_query(q))
+
+        expanded_clean: List[str] = []
+        seen = set()
+        for q in expanded:
+            k = q.lower()
+            if k not in seen:
+                seen.add(k)
+                expanded_clean.append(q)
+
+        for query in expanded_clean[:10]:
+            jobs = fetch_remotive(query)
+            all_jobs.extend(jobs)
+            query_log.append((f"Fallback Remotive: {query}", len(jobs)))
+
+    final = finalize_results(all_jobs, profile, strictness, top_n)
+    final["queries"] = queries
+    final["query_log"] = query_log
+    return final
+
+
+# =========================
 # UI
-# -----------------------------
-st.title("💼 AI Job Search Agent")
-st.caption("Upload a resume, describe target roles, and get ranked job links from the web.")
+# =========================
+def default_profile() -> Dict[str, Any]:
+    return {
+        "preferred_titles": [
+            "Director Quality Engineering",
+            "Director QA",
+            "Director Testing",
+            "Delivery Director",
+            "Client Partner",
+        ],
+        "skills": [
+            "quality engineering",
+            "test automation",
+            "program delivery",
+            "digital transformation",
+            "GenAI",
+        ],
+        "industries": ["telecom", "technology"],
+        "location": "New Jersey",
+        "include_remote": True,
+        "must_have_keywords": [],
+        "exclude_keywords": ["intern", "junior", "entry level"],
+    }
+
+
+def parse_multiline_or_csv(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = re.split(r"[\n,;]+", text)
+    return compact_list([p.strip() for p in parts if p.strip()], max_items=50)
+
+
+def render_job_card(job: JobRecord, rank: int) -> None:
+    posted_label = days_ago_text(job.posted_at)
+    tags = compact_list(job.tags, max_items=8)
+
+    with st.container(border=True):
+        col1, col2 = st.columns([5, 1])
+
+        with col1:
+            st.markdown(f"### {rank}. [{job.title}]({job.url})")
+            st.write(f"**{job.company}**")
+            st.write(f"{job.location} • {job.remote_type}")
+            st.write(f"**Why it matches:** {job.match_explanation}")
+
+        with col2:
+            st.metric("Score", f"{job.match_score:.1f}")
+            st.caption(posted_label)
+
+        meta = []
+        if job.salary:
+            meta.append(f"Salary: {job.salary}")
+        if job.employment_type:
+            meta.append(f"Type: {job.employment_type}")
+        if job.source:
+            meta.append(f"Source: {job.source}")
+        if meta:
+            st.caption(" | ".join(meta))
+
+        if tags:
+            st.caption("Tags: " + " • ".join(tags))
+
+        snippet = job.description[:650].strip()
+        if snippet:
+            st.write(snippet + ("..." if len(job.description) > 650 else ""))
+
+
+def jobs_to_dataframe(jobs: List[JobRecord]) -> pd.DataFrame:
+    rows = []
+    for job in jobs:
+        rows.append({
+            "title": job.title,
+            "company": job.company,
+            "location": job.location,
+            "remote_type": job.remote_type,
+            "score": job.match_score,
+            "why_match": job.match_explanation,
+            "posted": days_ago_text(job.posted_at),
+            "salary": job.salary,
+            "employment_type": job.employment_type,
+            "source": job.source,
+            "url": job.url,
+        })
+    return pd.DataFrame(rows)
+
+
+# =========================
+# Main
+# =========================
+st.title("🔎 Job Search Agent")
+st.caption("Broader retrieval + better ranking for senior QA / delivery / transformation roles")
 
 with st.sidebar:
-    st.header("Configuration")
-    model_name = st.text_input("OpenAI model", value=DEFAULT_MODEL)
-    max_results = st.slider("Max jobs to rank", min_value=10, max_value=100, value=25, step=5)
-    senior_only = st.checkbox("Only senior roles", value=False)
-    st.markdown("**Required env vars**")
-    st.code("""OPENAI_API_KEY
-ADZUNA_APP_ID
-ADZUNA_APP_KEY""")
-    st.info(
-        "LinkedIn scraping is intentionally avoided. For reliable job search results, configure Adzuna keys; DuckDuckGo fallback is best-effort only."
+    st.header("Search Profile")
+
+    defaults = default_profile()
+
+    preferred_titles_text = st.text_area(
+        "Preferred titles",
+        value="\n".join(defaults["preferred_titles"]),
+        height=140,
+        help="One per line or comma-separated.",
     )
 
-DEFAULT_MODEL = model_name
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    uploaded_resume = st.file_uploader(
-        "Upload resume",
-        type=["pdf", "docx", "txt"],
-        help="Supported: PDF, DOCX, TXT",
-    )
-    expected_roles = st.text_area(
-        "Expected roles",
-        placeholder="Example: QA Director, Head of Quality Engineering, Testing Transformation Leader",
-        height=120,
-    )
-    expected_designations = st.text_area(
-        "Expected designations",
-        placeholder="Example: Director, Senior Director, AVP, VP",
+    skills_text = st.text_area(
+        "Core skills / themes",
+        value=", ".join(defaults["skills"]),
         height=100,
     )
-    locations = st.text_input(
-        "Preferred locations",
-        value="United States",
-        placeholder="Example: New Jersey, New York, Remote, Dallas",
+
+    industries_text = st.text_input(
+        "Industries",
+        value=", ".join(defaults["industries"]),
     )
 
-with col2:
-    st.subheader("How it works")
-    st.markdown(
-        """
-1. Parse the uploaded resume
-2. Use OpenAI to extract target titles, skills, and search queries
-3. Search the web across multiple job sources
-4. Rank jobs by fit using the model
-5. Show the best matches with reasons
-        """
+    location = st.text_input("Preferred location", value=defaults["location"])
+    include_remote = st.checkbox("Include remote-friendly jobs", value=True)
+
+    must_have_keywords_text = st.text_input(
+        "Boost if contains these keywords",
+        value="",
+        help="Comma-separated. Example: telecom, stakeholder, governance",
     )
 
-run = st.button("Search Jobs", type="primary", use_container_width=True)
+    exclude_keywords_text = st.text_input(
+        "Penalize if contains these keywords",
+        value=", ".join(defaults["exclude_keywords"]),
+    )
 
-if run:
-    try:
-        st.write("🚀 Starting job search...")
-        if not uploaded_resume:
-            st.error("Please upload a resume.")
-            st.stop()
+    strictness = st.selectbox("Search strictness", ["Balanced", "Strict", "Broad"], index=0)
+    top_n = st.slider("Results to show", min_value=10, max_value=50, value=25, step=5)
 
-        with st.spinner("Reading resume..."):
-            resume_text = extract_resume_text(uploaded_resume)
-            if not resume_text.strip():
-                st.error("Could not extract text from the resume.")
-                st.stop()
+    run_btn = st.button("Run search", type="primary", use_container_width=True)
 
-        with st.spinner("Building job search plan..."):
-            st.write("Calling OpenAI to generate search plan...")
-            plan = build_search_plan(
-                resume_text=resume_text,
-                expected_roles=expected_roles,
-                expected_designations=expected_designations,
-                locations=locations,
-            )
-            plan = generate_default_queries(plan, locations)
+profile = {
+    "preferred_titles": parse_multiline_or_csv(preferred_titles_text),
+    "skills": parse_multiline_or_csv(skills_text),
+    "industries": parse_multiline_or_csv(industries_text),
+    "location": location.strip(),
+    "include_remote": include_remote,
+    "must_have_keywords": parse_multiline_or_csv(must_have_keywords_text),
+    "exclude_keywords": parse_multiline_or_csv(exclude_keywords_text),
+}
 
-        st.subheader("Candidate Summary")
-        st.write(plan.get("candidate_summary", ""))
+if run_btn:
+    with st.spinner("Searching across sources, widening queries, ranking results..."):
+        final = run_search(profile, strictness, top_n)
 
-        a, b = st.columns(2)
-        with a:
-            st.markdown("**Target Titles**")
-            st.write(plan.get("target_titles", []))
-        with b:
-            st.markdown("**Skill Keywords**")
-            st.write(plan.get("skills_keywords", []))
+    jobs = final["jobs"]
+    df = jobs_to_dataframe(jobs)
 
-        with st.expander("Generated search queries"):
-            st.json(plan.get("search_queries", []))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Raw jobs", final["raw_count"])
+    c2.metric("Unique jobs", final["deduped_count"])
+    c3.metric("Returned", final["final_count"])
+    c4.metric("Threshold", final["threshold"])
 
-        with st.spinner("Searching job sources..."):
-            st.write("Searching jobs from web...")
-            jobs = collect_jobs(plan, max_per_query=max(12, max_results), location=locations, senior_only=senior_only)
-            st.write(f"Fetched {len(jobs)} candidate jobs before ranking.")
-            if len(jobs) < max_results and senior_only:
-                fallback_jobs = collect_jobs(plan, max_per_query=max(12, max_results), location=locations, senior_only=False)
-                st.write(f"Senior-only filter was too strict. Fallback broad search found {len(fallback_jobs)} jobs.")
-                jobs = fallback_jobs
+    with st.expander("Queries tried", expanded=False):
+        st.write(final["queries"])
+        log_df = pd.DataFrame(final["query_log"], columns=["query", "jobs_found"])
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
 
-        if not jobs:
-            if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-                st.warning("No job results found. DuckDuckGo fallback is unreliable on Streamlit Cloud. Add ADZUNA_APP_ID and ADZUNA_APP_KEY in Secrets for reliable internet job search.")
-            else:
-                st.warning("No job results found. Try broader roles or locations.")
-            st.stop()
+    if df.empty:
+        st.warning("No jobs came back after ranking. Try Broad mode and remove narrow keywords.")
+    else:
+        st.subheader("Top matches")
 
-        with st.spinner("Ranking jobs..."):
-            st.write("Ranking jobs using AI...")
-            ranked_jobs = rank_jobs(
-                resume_text=resume_text,
-                expected_roles=expected_roles,
-                expected_designations=expected_designations,
-                jobs=jobs[:max_results],
-            )
+        for idx, job in enumerate(jobs, start=1):
+            render_job_card(job, idx)
 
-        st.subheader(f"Top Matches ({len(ranked_jobs)})")
-        if len(ranked_jobs) < max_results:
-            st.info(f"Only {len(ranked_jobs)} matching roles were found after filtering. To get closer to {max_results}, broaden locations, add more designations, or turn off 'Only senior roles'.")
-        for job in ranked_jobs:
-            with st.container(border=True):
-                st.markdown(f"### [{job.get('title', 'Untitled Job')}]({job.get('url', '#')})")
-                st.write(f"**Source:** {job.get('source', 'web')}  |  **Fit Score:** {job.get('fit_score', 0)}/100")
-                if job.get("display_link"):
-                    st.caption(job.get("display_link"))
-                if job.get("snippet"):
-                    st.write(job.get("snippet"))
-                if job.get("reason"):
-                    st.write(f"**Why this matches:** {job.get('reason')}")
-                highlights = job.get("match_highlights", [])
-                if highlights:
-                    st.write("**Match highlights:**")
-                    for h in highlights:
-                        st.write(f"- {h}")
+        st.subheader("Export")
+        st.download_button(
+            "Download results as CSV",
+            data=to_csv_download(df),
+            file_name="job_search_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-        with st.expander("Raw extracted resume text"):
-            st.text_area("Resume text", resume_text[:20000], height=350)
-
-    except Exception as exc:
-        st.exception(exc)
-
-
-# -----------------------------
-# Requirements (save separately if needed)
-# -----------------------------
-# streamlit
-# openai
-# requests
-# PyPDF2
-# python-docx
-
-# Run with:
-# streamlit run job_agent_streamlit.py
+        with st.expander("Tabular view", expanded=False):
+            st.dataframe(df, use_container_width=True, hide_index=True)
+else:
+    st.info(
+        "Set your profile in the sidebar and click **Run search**. "
+        "Balanced mode is the safest default; Broad mode is better when the market is thin."
+    )
