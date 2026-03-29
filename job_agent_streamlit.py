@@ -24,7 +24,7 @@ except Exception:
 st.set_page_config(page_title="AI Job Search Agent", page_icon="💼", layout="wide")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 # -----------------------------
@@ -151,6 +151,7 @@ Resume:
 """
 
     response = client.responses.create(
+        timeout=60,
         model=DEFAULT_MODEL,
         input=prompt,
         text={"format": SCHEMA},
@@ -164,33 +165,41 @@ DDG_ENDPOINT = "https://duckduckgo.com/html/"
 
 def serp_search(query: str, num: int = 10) -> List[Dict[str, Any]]:
     """
-    Lightweight search using DuckDuckGo HTML (no API key).
-    Note: This is a simple parser and may not be as stable as paid APIs.
+    Improved DuckDuckGo search with better parsing
     """
     headers = {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     params = {
         "q": query
     }
-    resp = requests.post(DDG_ENDPOINT, data=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    html = resp.text
 
-    # very simple parsing of results
-    results = []
-    links = re.findall(r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>', html)
+    try:
+        resp = requests.post(DDG_ENDPOINT, data=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        html = resp.text
 
-    for link, title in links[:num]:
-        clean_title = re.sub('<.*?>', '', title)
-        results.append({
-            "title": clean_title,
-            "link": link,
-            "snippet": "",
-            "displayed_link": link
-        })
+        results = []
 
-    return results
+        # Improved regex patterns
+        links = re.findall(r'<a[^>]+class="result__a"[^>]+href="(.*?)"[^>]*>(.*?)</a>', html)
+
+        for link, title in links[:num]:
+            clean_title = re.sub('<.*?>', '', title)
+
+            # Filter only job-related links
+            if any(domain in link.lower() for domain in ["linkedin", "indeed", "glassdoor", "jobs", "careers"]):
+                results.append({
+                    "title": clean_title,
+                    "link": link,
+                    "snippet": "",
+                    "displayed_link": link
+                })
+
+        return results
+
+    except Exception as e:
+        return []
 
 
 def normalize_url(url: str) -> str:
@@ -294,6 +303,7 @@ def rank_jobs(
     }
 
     response = client.responses.create(
+        timeout=60,
         model=DEFAULT_MODEL,
         input=json.dumps(prompt),
         text={"format": RANK_SCHEMA},
@@ -311,8 +321,33 @@ def rank_jobs(
 
 
 def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, Any]:
-    if plan.get("search_queries"):
-        return plan
+    titles = plan.get("target_titles", [])[:4]
+    if not titles:
+        titles = ["QA Director", "Quality Engineering Director"]
+
+    loc = locations.strip() if locations else "United States"
+    queries = []
+
+    for title in titles:
+        queries.append({
+            "source": "linkedin",
+            "query": f'{title} jobs {loc} site:linkedin.com'
+        })
+        queries.append({
+            "source": "indeed",
+            "query": f'{title} jobs {loc} site:indeed.com'
+        })
+        queries.append({
+            "source": "glassdoor",
+            "query": f'{title} jobs {loc} site:glassdoor.com'
+        })
+        queries.append({
+            "source": "general",
+            "query": f'{title} jobs {loc}'
+        })
+
+    plan["search_queries"] = queries
+    return plan
 
     titles = plan.get("target_titles", [])[:4]
     if not titles:
@@ -399,6 +434,7 @@ run = st.button("Search Jobs", type="primary", use_container_width=True)
 
 if run:
     try:
+        st.write("🚀 Starting job search...")
         if not uploaded_resume:
             st.error("Please upload a resume.")
             st.stop()
@@ -410,6 +446,7 @@ if run:
                 st.stop()
 
         with st.spinner("Building job search plan..."):
+            st.write("Calling OpenAI to generate search plan...")
             plan = build_search_plan(
                 resume_text=resume_text,
                 expected_roles=expected_roles,
@@ -433,6 +470,7 @@ if run:
             st.json(plan.get("search_queries", []))
 
         with st.spinner("Searching job sources..."):
+            st.write("Searching jobs from web...")
             jobs = collect_jobs(plan, max_per_query=6)
 
         if not jobs:
@@ -440,6 +478,7 @@ if run:
             st.stop()
 
         with st.spinner("Ranking jobs..."):
+            st.write("Ranking jobs using AI...")
             ranked_jobs = rank_jobs(
                 resume_text=resume_text,
                 expected_roles=expected_roles,
