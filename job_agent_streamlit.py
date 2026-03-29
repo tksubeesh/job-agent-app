@@ -423,7 +423,7 @@ with st.sidebar:
     st.markdown("**Required env vars**")
     st.code("""OPENAI_API_KEY
 ADZUNA_APP_ID
-ADZUNA_APP_KEY")
+ADZUNA_APP_KEY""")
     st.info(
         "LinkedIn scraping is intentionally avoided. For reliable job search results, configure Adzuna keys; DuckDuckGo fallback is best-effort only."
     )
