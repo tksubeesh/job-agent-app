@@ -171,28 +171,37 @@ def adzuna_search(query: str, location: str, num: int = 10) -> List[Dict[str, An
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
         return []
 
-    params = {
-        "app_id": ADZUNA_APP_ID,
-        "app_key": ADZUNA_APP_KEY,
-        "results_per_page": min(num, 20),
-        "what": query,
-        "where": location or "United States",
-        "content-type": "application/json",
-    }
+    jobs = []
+    pages_to_fetch = max(1, min(3, (num + 19) // 20))
 
     try:
-        resp = requests.get(ADZUNA_ENDPOINT, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        jobs = []
-        for item in data.get("results", []):
-            jobs.append({
-                "title": item.get("title", "Untitled Job"),
-                "link": item.get("redirect_url") or item.get("adref", ""),
-                "snippet": item.get("description", "")[:300],
-                "displayed_link": item.get("company", {}).get("display_name", "Adzuna"),
-            })
-        return jobs
+        for page in range(1, pages_to_fetch + 1):
+            endpoint = f"https://api.adzuna.com/v1/api/jobs/us/search/{page}"
+            params = {
+                "app_id": ADZUNA_APP_ID,
+                "app_key": ADZUNA_APP_KEY,
+                "results_per_page": min(20, num),
+                "what": query,
+                "where": location or "United States",
+                "content-type": "application/json",
+            }
+
+            resp = requests.get(endpoint, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            for item in data.get("results", []):
+                jobs.append({
+                    "title": item.get("title", "Untitled Job"),
+                    "link": item.get("redirect_url") or item.get("adref", ""),
+                    "snippet": item.get("description", "")[:300],
+                    "displayed_link": item.get("company", {}).get("display_name", "Adzuna"),
+                })
+
+                if len(jobs) >= num:
+                    return jobs[:num]
+
+        return jobs[:num]
     except Exception:
         return []
 
@@ -238,9 +247,14 @@ def normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 8, location: str = "United States") -> List[Dict[str, Any]]:
+def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 12, location: str = "United States") -> List[Dict[str, Any]]:
     all_jobs: List[Dict[str, Any]] = []
     seen = set()
+
+    senior_keywords = [
+        "director", "senior director", "executive director", "head", "vp", "vice president",
+        "senior manager", "associate director", "principal", "lead"
+    ]
 
     for item in search_plan.get("search_queries", []):
         source = item.get("source", "web")
@@ -256,18 +270,23 @@ def collect_jobs(search_plan: Dict[str, Any], max_per_query: int = 8, location: 
             results = serp_search(query, num=max_per_query)
 
         for r in results:
-            title = r.get("title", "")
+            title = r.get("title", "").lower()
             link = r.get("link", "")
             snippet = r.get("snippet", "")
             display_link = r.get("displayed_link", "")
+
+            if senior_keywords and not any(k in title for k in senior_keywords):
+                continue
+
             key = normalize_url(link)
             if not key or key in seen:
                 continue
             seen.add(key)
+
             all_jobs.append(
                 {
                     "source": source,
-                    "title": title,
+                    "title": r.get("title", ""),
                     "url": link,
                     "snippet": snippet,
                     "display_link": display_link,
@@ -355,9 +374,15 @@ def rank_jobs(
 
 
 def generate_default_queries(plan: Dict[str, Any], locations: str) -> Dict[str, Any]:
-    titles = plan.get("target_titles", [])[:4]
+    titles = plan.get("target_titles", [])[:8]
     if not titles:
-        titles = ["QA Director", "Quality Engineering Director"]
+        titles = [
+            "QA Director",
+            "Quality Engineering Director",
+            "Senior Manager Quality Engineering",
+            "Associate Director QA",
+            "VP Quality Assurance",
+        ]
 
     loc = locations.strip() if locations else "United States"
     queries = []
@@ -419,7 +444,7 @@ st.caption("Upload a resume, describe target roles, and get ranked job links fro
 with st.sidebar:
     st.header("Configuration")
     model_name = st.text_input("OpenAI model", value=DEFAULT_MODEL)
-    max_results = st.slider("Max jobs to rank", min_value=10, max_value=50, value=25, step=5)
+    max_results = st.slider("Max jobs to rank", min_value=10, max_value=100, value=25, step=5)
     st.markdown("**Required env vars**")
     st.code("""OPENAI_API_KEY
 ADZUNA_APP_ID
@@ -507,7 +532,8 @@ if run:
 
         with st.spinner("Searching job sources..."):
             st.write("Searching jobs from web...")
-            jobs = collect_jobs(plan, max_per_query=6, location=locations)
+            jobs = collect_jobs(plan, max_per_query=max(12, max_results), location=locations)
+            st.write(f"Fetched {len(jobs)} candidate jobs before ranking.")
 
         if not jobs:
             if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
@@ -526,6 +552,8 @@ if run:
             )
 
         st.subheader(f"Top Matches ({len(ranked_jobs)})")
+        if len(ranked_jobs) < max_results:
+            st.info(f"Only {len(ranked_jobs)} matching roles were found after filtering. To get closer to {max_results}, broaden locations, add more designations, or relax seniority filters.")
         for job in ranked_jobs:
             with st.container(border=True):
                 st.markdown(f"### [{job.get('title', 'Untitled Job')}]({job.get('url', '#')})")
